@@ -53,7 +53,8 @@ func (svc *Service) Stream(ctx context.Context, input *StreamInput, send func(St
 		convID = conv.ID
 	}
 
-	if _, err := svc.store.AppendMessage(convID, "user", input.Input, "openai", input.Model, 0, 0); err != nil {
+	userMsg, err := svc.store.AppendMessage(convID, "user", input.Input, "openai", input.Model, 0, 0)
+	if err != nil {
 		send(StreamEvent{Event: "error", Data: map[string]string{"message": "failed to save message"}})
 		return fmt.Errorf("append user message: %w", err)
 	}
@@ -91,7 +92,7 @@ func (svc *Service) Stream(ctx context.Context, input *StreamInput, send func(St
 					send(StreamEvent{Event: "part", Data: part})
 				}
 			}
-		case "part":
+		case "part", "reasoning.delta":
 			send(ev)
 		case "usage":
 			if u, ok := ev.Data.(map[string]int); ok {
@@ -104,10 +105,13 @@ func (svc *Service) Stream(ctx context.Context, input *StreamInput, send func(St
 				content += s
 				send(StreamEvent{Event: "message.delta", Data: map[string]string{"delta": s}})
 			}
-			if _, err := svc.store.AppendMessage(convID, "assistant", content, "openai", input.Model, inputTokens, outputTokens); err != nil {
+			completed := map[string]string{"conversation_id": convID, "user_message_id": userMsg.ID}
+			if m, err := svc.store.AppendMessage(convID, "assistant", content, "openai", input.Model, inputTokens, outputTokens); err != nil {
 				svc.logger.Error("failed to persist assistant message", "error", err)
+			} else {
+				completed["message_id"] = m.ID
 			}
-			send(StreamEvent{Event: "message.completed", Data: map[string]string{"conversation_id": convID}})
+			send(StreamEvent{Event: "message.completed", Data: completed})
 		case "error":
 			svc.logger.Error("provider stream error", "error", ev.Data)
 			send(ev)

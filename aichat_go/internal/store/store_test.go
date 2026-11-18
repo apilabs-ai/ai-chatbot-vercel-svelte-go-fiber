@@ -83,3 +83,21 @@ func TestInMemoryStore_UpdateConversationTitle(t *testing.T) {
 		t.Fatalf("title = %q", got.Title)
 	}
 }
+
+func TestInMemoryStore_TruncateAfter(t *testing.T) {
+	s := NewInMemoryStore()
+	c, _ := s.CreateConversation("t", "w", "u")
+	_, _ = s.AppendMessage(c.ID, "user", "1", "", "", 0, 0)
+	keep, _ := s.AppendMessage(c.ID, "assistant", "2", "", "", 0, 0)
+	_, _ = s.AppendMessage(c.ID, "user", "3", "", "", 0, 0)
+
+	if ok, _ := s.TruncateAfter(c.ID, keep.ID); !ok {
+		t.Fatal("expected truncate ok")
+	}
+	if msgs, _ := s.GetMessages(c.ID); len(msgs) != 2 || msgs[1].ID != keep.ID {
+		t.Fatalf("got %d messages", len(msgs))
+	}
+	if ok, _ := s.TruncateAfter(c.ID, "missing"); ok {
+		t.Fatal("unknown message must not truncate")
+	}
+}

@@ -10,12 +10,13 @@ import (
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
+	"github.com/openai/openai-go/v3/responses"
 	"github.com/openai/openai-go/v3/shared"
 )
 
 type Provider struct {
 	client       openai.Client
-	defaultModel shared.ChatModel
+	defaultModel string
 }
 
 type structuredIntent string
@@ -30,91 +31,162 @@ const (
 )
 
 func NewProvider(apiKey, defaultModel string) *Provider {
-	model := shared.ChatModel(defaultModel)
 	if defaultModel == "" {
-		model = shared.ChatModelGPT4oMini
+		defaultModel = "gpt-4o-mini"
 	}
 	return &Provider{
 		client:       openai.NewClient(option.WithAPIKey(apiKey)),
-		defaultModel: model,
+		defaultModel: defaultModel,
 	}
+}
+
+// IsReasoningModel reports whether a model emits reasoning summaries.
+// ponytail: prefix heuristic; move to per-model config if a model breaks the pattern.
+func IsReasoningModel(model string) bool {
+	return strings.HasPrefix(model, "o") || strings.HasPrefix(model, "gpt-5")
 }
 
 func (p *Provider) Stream(ctx context.Context, input *chat.StreamInput, history []chat.MessageRecord, out chan<- chat.StreamEvent) {
 	defer close(out)
 
-	intent := inferIntentFromPrompt(input.Input)
-
 	model := p.defaultModel
 	if input.Model != "" {
-		model = shared.ChatModel(input.Model)
+		model = input.Model
 	}
 
-	messages := make([]openai.ChatCompletionMessageParamUnion, 0, len(history)+1)
+	// history already ends with the current user message (service appends it first).
+	items := make(responses.ResponseInputParam, 0, len(history))
 	for _, h := range history {
+		role := responses.EasyInputMessageRoleUser
 		if h.Role == "assistant" {
-			messages = append(messages, openai.AssistantMessage(h.Content))
-		} else {
-			messages = append(messages, openai.UserMessage(h.Content))
+			role = responses.EasyInputMessageRoleAssistant
+		}
+		items = append(items, responses.ResponseInputItemParamOfMessage(h.Content, role))
+	}
+
+	params := responses.ResponseNewParams{
+		Model: shared.ResponsesModel(model),
+		Input: responses.ResponseNewParamsInputUnion{OfInputItemList: items},
+		Store: openai.Bool(false),
+	}
+	if IsReasoningModel(model) {
+		params.Reasoning = shared.ReasoningParam{Summary: shared.ReasoningSummaryAuto}
+	}
+	for _, t := range input.Tools {
+		switch t {
+		case "web_search":
+			params.Tools = append(params.Tools, responses.ToolParamOfWebSearch(responses.WebSearchToolTypeWebSearch))
+		case "image_generation":
+			params.Tools = append(params.Tools, responses.ToolUnionParam{OfImageGeneration: &responses.ToolImageGenerationParam{}})
 		}
 	}
-	messages = append(messages, openai.UserMessage(input.Input))
 
-	params := openai.ChatCompletionNewParams{
-		Model:    model,
-		Messages: messages,
-		StreamOptions: openai.ChatCompletionStreamOptionsParam{
-			IncludeUsage: openai.Bool(true),
-		},
-	}
-
-	stream := p.client.Chat.Completions.NewStreaming(ctx, params)
-
-	var fullContent string
-	var inputTokens, outputTokens int
-
+	st := &streamState{intent: inferIntentFromPrompt(input.Input)}
+	stream := p.client.Responses.NewStreaming(ctx, params)
 	for stream.Next() {
-		chunk := stream.Current()
-		if len(chunk.Choices) > 0 {
-			delta := chunk.Choices[0].Delta.Content
-			if delta != "" {
-				fullContent += delta
-				// For structured intents, buffer and emit a typed part at the end.
-				if intent == intentNone {
-					out <- chat.StreamEvent{Event: "message.delta", Data: map[string]string{"delta": delta}}
-				}
-			}
-		}
-		if chunk.JSON.Usage.Valid() {
-			inputTokens = int(chunk.Usage.PromptTokens)
-			outputTokens = int(chunk.Usage.CompletionTokens)
-		}
+		st.handle(stream.Current(), out)
 	}
-
 	if err := stream.Err(); err != nil {
 		out <- chat.StreamEvent{Event: "error", Data: map[string]string{"message": err.Error()}}
 		return
 	}
-
-	if outputTokens == 0 && fullContent != "" {
-		outputTokens = len(fullContent) / 4
+	if st.failed {
+		return
 	}
-	if inputTokens == 0 {
-		inputTokens = 100
-	}
+	st.finish(input.Input, out)
+}
 
-	if intent != intentNone {
-		if part, ok := buildStructuredPart(intent, input.Input, fullContent); ok {
+// streamState accumulates one Responses API stream. Kept free of network types
+// beyond the event union so it can be driven from tests.
+type streamState struct {
+	intent      structuredIntent
+	content     string
+	sources     []map[string]string
+	seenSources map[string]bool
+	inputTok    int
+	outputTok   int
+	failed      bool
+}
+
+func (st *streamState) handle(ev responses.ResponseStreamEventUnion, out chan<- chat.StreamEvent) {
+	switch ev.Type {
+	case "response.output_text.delta":
+		if ev.Delta == "" {
+			return
+		}
+		st.content += ev.Delta
+		// For structured intents, buffer and emit a typed part at the end.
+		if st.intent == intentNone {
+			out <- chat.StreamEvent{Event: "message.delta", Data: map[string]string{"delta": ev.Delta}}
+		}
+	case "response.reasoning_summary_text.delta":
+		if ev.Delta != "" {
+			out <- chat.StreamEvent{Event: "reasoning.delta", Data: map[string]string{"delta": ev.Delta}}
+		}
+	case "response.output_text.annotation.added":
+		a := ev.Annotation
+		if a.Type != "url_citation" || a.URL == "" {
+			return
+		}
+		if st.seenSources == nil {
+			st.seenSources = map[string]bool{}
+		}
+		if st.seenSources[a.URL] {
+			return
+		}
+		st.seenSources[a.URL] = true
+		title := a.Title
+		if title == "" {
+			title = a.URL
+		}
+		st.sources = append(st.sources, map[string]string{"title": title, "url": a.URL})
+	case "response.output_item.done":
+		if ev.Item.Type == "image_generation_call" && ev.Item.Result != "" {
+			format := ev.Item.OutputFormat
+			if format == "" {
+				format = "png"
+			}
+			out <- chat.StreamEvent{Event: "part", Data: chat.PartEvent{
+				Type:    "image",
+				Content: ev.Item.Result,
+				Meta:    map[string]interface{}{"media_type": "image/" + format},
+			}}
+		}
+	case "response.completed":
+		st.inputTok = int(ev.Response.Usage.InputTokens)
+		st.outputTok = int(ev.Response.Usage.OutputTokens)
+	case "response.failed", "error":
+		msg := ev.Message
+		if msg == "" {
+			msg = ev.Response.Error.Message
+		}
+		if msg == "" {
+			msg = "response failed"
+		}
+		st.failed = true
+		out <- chat.StreamEvent{Event: "error", Data: map[string]string{"message": msg}}
+	}
+}
+
+func (st *streamState) finish(prompt string, out chan<- chat.StreamEvent) {
+	content := st.content
+	if st.intent != intentNone {
+		if part, ok := buildStructuredPart(st.intent, prompt, content); ok {
 			out <- chat.StreamEvent{Event: "part", Data: part}
-			fullContent = ""
-		} else if fullContent != "" {
+			content = ""
+		} else if content != "" {
 			// Fallback to plain text if we couldn't construct a valid structured part.
-			out <- chat.StreamEvent{Event: "message.delta", Data: map[string]string{"delta": fullContent}}
+			out <- chat.StreamEvent{Event: "message.delta", Data: map[string]string{"delta": content}}
 		}
 	}
-
-	out <- chat.StreamEvent{Event: "usage", Data: map[string]int{"input_tokens": inputTokens, "output_tokens": outputTokens}}
-	out <- chat.StreamEvent{Event: "_stream_done", Data: map[string]string{"content": fullContent}}
+	if len(st.sources) > 0 {
+		out <- chat.StreamEvent{Event: "part", Data: chat.PartEvent{
+			Type: "sources",
+			Meta: map[string]interface{}{"sources": st.sources},
+		}}
+	}
+	out <- chat.StreamEvent{Event: "usage", Data: map[string]int{"input_tokens": st.inputTok, "output_tokens": st.outputTok}}
+	out <- chat.StreamEvent{Event: "_stream_done", Data: map[string]string{"content": content}}
 }
 
 func inferIntentFromPrompt(prompt string) structuredIntent {

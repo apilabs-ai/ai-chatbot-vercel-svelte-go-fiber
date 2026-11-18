@@ -115,6 +115,21 @@ func (s *InMemoryStore) GetMessages(convID string) ([]*Message, error) {
 	return append([]*Message(nil), s.messages[convID]...), nil
 }
 
+// TruncateAfter drops every message after msgID, keeping msgID itself.
+// Returns false if msgID is not in the conversation.
+func (s *InMemoryStore) TruncateAfter(convID, msgID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	msgs := s.messages[convID]
+	for i, m := range msgs {
+		if m.ID == msgID {
+			s.messages[convID] = msgs[:i+1]
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (s *InMemoryStore) UpdateConversationTitle(convID, title string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

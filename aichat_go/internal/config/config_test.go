@@ -51,3 +51,18 @@ func TestLoad_customEnv(t *testing.T) {
 		t.Fatalf("CORS = %q", c.CORSAllowOrigins)
 	}
 }
+
+func TestLoad_modelsAllowList(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "k")
+	t.Setenv("OPENAI_MODEL", "gpt-4o")
+	t.Setenv("OPENAI_MODELS", "")
+	c, _ := Load()
+	if c.Models[0] != "gpt-4o" || len(c.Models) != 3 {
+		t.Fatalf("default model first, no duplicates: %v", c.Models)
+	}
+	t.Setenv("OPENAI_MODELS", " a , b,a")
+	c, _ = Load()
+	if len(c.Models) != 2 || c.Models[0] != "a" {
+		t.Fatalf("custom list: %v", c.Models)
+	}
+}
