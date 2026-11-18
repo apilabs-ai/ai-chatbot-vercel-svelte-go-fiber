@@ -57,7 +57,6 @@ go test ./...
 ### UI
 
 ```bash
-pnpm lint
 pnpm check
 pnpm test
 ```

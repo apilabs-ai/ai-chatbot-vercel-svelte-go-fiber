@@ -16,6 +16,21 @@ export interface StreamChatRequest {
 	tenant_id?: string;
 	workspace_id?: string;
 	model?: string;
+	/** Opt-in backend tools */
+	tools?: Array<'web_search' | 'image_generation'>;
+}
+
+export interface ModelInfo {
+	id: string;
+	reasoning: boolean;
+	default: boolean;
+}
+
+export interface CompletedInfo {
+	conversation_id: string;
+	/** Backend ids, used for checkpoint restore */
+	user_message_id?: string;
+	message_id?: string;
 }
 
 export interface ConversationListItem {
@@ -43,17 +58,19 @@ export interface MessageListItem {
 // --- SSE event types (normalized contract) ---
 
 export type SSEDeltaEvent = { delta: string };
-export type SSECompletedEvent = { conversation_id: string };
+export type SSECompletedEvent = CompletedInfo;
+export type SSEReasoningDeltaEvent = { delta: string };
 export type SSEUsageEvent = { input_tokens: number; output_tokens: number };
 export type SSEErrorEvent = { message: string };
 
 export type SSEEvent =
 	| { event: 'message.delta'; data: SSEDeltaEvent }
+	| { event: 'reasoning.delta'; data: SSEReasoningDeltaEvent }
 	| { event: 'message.completed'; data: SSECompletedEvent }
 	| { event: 'usage'; data: SSEUsageEvent }
 	| { event: 'error'; data: SSEErrorEvent };
 
-/** Structured part from backend (code, artifact, plan, queue, confirmation) */
+/** Structured part from backend (code, artifact, plan, queue, confirmation, sources, image) */
 export interface StreamPart {
 	type: string;
 	content?: string;
@@ -63,7 +80,8 @@ export interface StreamPart {
 export interface StreamCallbacks {
 	onDelta?: (delta: string) => void;
 	onPart?: (part: StreamPart) => void;
-	onCompleted?: (conversationId: string) => void;
+	onReasoningDelta?: (delta: string) => void;
+	onCompleted?: (info: CompletedInfo) => void;
 	onUsage?: (inputTokens: number, outputTokens: number) => void;
 	onError?: (message: string) => void;
 }
@@ -95,6 +113,7 @@ export async function streamChat(
 		input: request.input,
 		...(request.conversation_id && { conversation_id: request.conversation_id }),
 		...(request.model && { model: request.model }),
+		...(request.tools?.length && { tools: request.tools }),
 	};
 	if (config.tenantId) body.tenant_id = config.tenantId;
 	if (config.workspaceId) body.workspace_id = config.workspaceId;
@@ -129,6 +148,9 @@ export async function streamChat(
 
 	const decoder = new TextDecoder();
 	let buffer = '';
+	// Must survive across reads: a large data line (e.g. a base64 image) can
+	// arrive in a later chunk than its "event:" line.
+	let currentEvent: string | null = null;
 
 	try {
 		while (true) {
@@ -138,7 +160,6 @@ export async function streamChat(
 			const lines = buffer.split(/\n/);
 			buffer = lines.pop() ?? '';
 
-			let currentEvent: string | null = null;
 			for (const line of lines) {
 				if (line.startsWith('event:')) {
 					currentEvent = line.slice(6).trim();
@@ -159,9 +180,12 @@ export async function streamChat(
 										meta: data.meta && typeof data.meta === 'object' ? (data.meta as Record<string, unknown>) : undefined
 									});
 								break;
+							case 'reasoning.delta':
+								if (typeof data.delta === 'string') callbacks.onReasoningDelta?.(data.delta);
+								break;
 							case 'message.completed':
 								if (typeof data.conversation_id === 'string')
-									callbacks.onCompleted?.(data.conversation_id);
+									callbacks.onCompleted?.(data as unknown as CompletedInfo);
 								break;
 							case 'usage':
 								callbacks.onUsage?.(
@@ -238,4 +262,37 @@ export async function getConversationMessages(
 	if (data?.messages && Array.isArray(data.messages))
 		return data.messages as MessageListItem[];
 	return [];
+}
+
+/**
+ * GET /v1/models — allow-listed models the backend accepts.
+ */
+export async function getModels(config: ChatApiConfig): Promise<ModelInfo[]> {
+	const res = await fetch(`${ensureBaseUrl(config.apiBaseUrl)}/models`, {
+		headers: { ...authHeaders(config.authToken) },
+	});
+	if (!res.ok) throw new Error(`Failed to load models: ${res.status}`);
+	const data = await res.json();
+	return Array.isArray(data) ? (data as ModelInfo[]) : [];
+}
+
+/**
+ * POST /v1/conversations/:id/restore — drop every message after messageId.
+ */
+export async function restoreConversation(
+	config: ChatApiConfig,
+	conversationId: string,
+	messageId: string
+): Promise<void> {
+	const url = `${ensureBaseUrl(config.apiBaseUrl)}/conversations/${encodeURIComponent(conversationId)}/restore`;
+	const res = await fetch(url, {
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json',
+			...authHeaders(config.authToken),
+			...(config.tenantId && { 'X-Tenant-ID': config.tenantId }),
+		},
+		body: JSON.stringify({ message_id: messageId }),
+	});
+	if (!res.ok) throw new Error(`Failed to restore checkpoint: ${res.status}`);
 }

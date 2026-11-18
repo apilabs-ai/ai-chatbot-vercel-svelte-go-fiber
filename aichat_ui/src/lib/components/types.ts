@@ -1,4 +1,4 @@
-export type DemoPartType = "text" | "code" | "artifact" | "confirmation" | "plan" | "queue" | "citation";
+export type DemoPartType = "text" | "code" | "artifact" | "confirmation" | "plan" | "queue" | "citation" | "sources" | "image";
 
 export interface DemoPart {
     type: DemoPartType;
@@ -11,6 +11,11 @@ export interface ChatMessage {
     role: "user" | "assistant";
     content: string;
     parts?: DemoPart[];
+    /** Streamed reasoning summary (reasoning models) */
+    reasoning?: string;
+    reasoningStreaming?: boolean;
+    /** Backend message id, set on completion; enables checkpoint restore */
+    backendId?: string;
     /** Token usage (from backend usage event), optional */
     input_tokens?: number;
     output_tokens?: number;
