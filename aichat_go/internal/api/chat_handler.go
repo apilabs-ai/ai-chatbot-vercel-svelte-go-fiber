@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/gofiber/fiber/v3"
@@ -15,14 +16,15 @@ import (
 )
 
 type streamRequest struct {
-	Input          string `json:"input"`
-	ConversationID string `json:"conversation_id"`
-	TenantID       string `json:"tenant_id"`
-	WorkspaceID    string `json:"workspace_id"`
-	Model          string `json:"model"`
+	Input          string   `json:"input"`
+	ConversationID string   `json:"conversation_id"`
+	TenantID       string   `json:"tenant_id"`
+	WorkspaceID    string   `json:"workspace_id"`
+	Model          string   `json:"model"`
+	Tools          []string `json:"tools"`
 }
 
-func StreamChat(_ *config.Config, _ *store.InMemoryStore, chatSvc *chat.Service) fiber.Handler {
+func StreamChat(cfg *config.Config, _ *store.InMemoryStore, chatSvc *chat.Service) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		var req streamRequest
 		if err := c.Bind().Body(&req); err != nil {
@@ -30,6 +32,10 @@ func StreamChat(_ *config.Config, _ *store.InMemoryStore, chatSvc *chat.Service)
 		}
 		if req.Input == "" {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "input is required"})
+		}
+		// Only allow-listed models: the client must not pick arbitrary (costly) models.
+		if req.Model != "" && !slices.Contains(cfg.Models, req.Model) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "model not allowed"})
 		}
 
 		tenantID := getString(c, "tenant_id", req.TenantID)
@@ -43,6 +49,7 @@ func StreamChat(_ *config.Config, _ *store.InMemoryStore, chatSvc *chat.Service)
 			WorkspaceID:    workspaceID,
 			UserID:         userID,
 			Model:          req.Model,
+			Tools:          req.Tools,
 		}
 
 		c.Set("Content-Type", "text/event-stream")

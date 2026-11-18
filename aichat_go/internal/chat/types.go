@@ -8,6 +8,7 @@ type StreamInput struct {
 	WorkspaceID    string
 	UserID         string
 	Model          string
+	Tools          []string
 }
 
 // StreamEvent is a single normalized event sent to the client (SSE).

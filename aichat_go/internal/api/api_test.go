@@ -221,3 +221,84 @@ func TestErrorHandler_fiberError(t *testing.T) {
 		t.Fatalf("status %d", resp.StatusCode)
 	}
 }
+
+func TestStreamChat_rejectsUnlistedModel(t *testing.T) {
+	st := store.NewInMemoryStore()
+	svc := chat.NewChatService(st, streamMock{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	app := fiber.New()
+	app.Post("/stream", StreamChat(&config.Config{Models: []string{"gpt-4o-mini"}}, st, svc))
+
+	req := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader(`{"input":"hi","model":"gpt-expensive"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d", resp.StatusCode)
+	}
+}
+
+func TestStreamChat_completedCarriesMessageIDs(t *testing.T) {
+	st := store.NewInMemoryStore()
+	svc := chat.NewChatService(st, streamMock{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	app := fiber.New()
+	app.Post("/stream", StreamChat(&config.Config{}, st, svc))
+
+	req := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader(`{"input":"hi"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, _ := app.Test(req)
+	raw, _ := io.ReadAll(resp.Body)
+	if !bytes.Contains(raw, []byte(`"user_message_id":"m_`)) || !bytes.Contains(raw, []byte(`"message_id":"m_`)) {
+		t.Fatalf("message.completed missing ids: %s", raw)
+	}
+}
+
+func TestRestoreConversation(t *testing.T) {
+	st := store.NewInMemoryStore()
+	c, _ := st.CreateConversation("tenant-a", "", "u")
+	keep, _ := st.AppendMessage(c.ID, "user", "1", "", "", 0, 0)
+	_, _ = st.AppendMessage(c.ID, "assistant", "2", "", "", 0, 0)
+
+	app := fiber.New()
+	app.Use(TenantFromHeader())
+	app.Post("/c/:id/restore", RestoreConversation(st))
+	post := func(tenant, body string) int {
+		req := httptest.NewRequest(http.MethodPost, "/c/"+c.ID+"/restore", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Tenant-ID", tenant)
+		resp, err := app.Test(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp.StatusCode
+	}
+
+	if code := post("tenant-b", `{"message_id":"`+keep.ID+`"}`); code != http.StatusNotFound {
+		t.Fatalf("other tenant: want 404, got %d", code)
+	}
+	if code := post("tenant-a", `{"message_id":"nope"}`); code != http.StatusNotFound {
+		t.Fatalf("unknown message: want 404, got %d", code)
+	}
+	if code := post("tenant-a", `{"message_id":"`+keep.ID+`"}`); code != http.StatusOK {
+		t.Fatalf("want 200, got %d", code)
+	}
+	if msgs, _ := st.GetMessages(c.ID); len(msgs) != 1 {
+		t.Fatalf("want 1 message after restore, got %d", len(msgs))
+	}
+}
+
+func TestListModels(t *testing.T) {
+	app := fiber.New()
+	app.Get("/models", ListModels(&config.Config{Models: []string{"gpt-4o-mini", "o4-mini"}}))
+	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/models", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []map[string]any
+	body, _ := io.ReadAll(resp.Body)
+	_ = json.Unmarshal(body, &got)
+	if len(got) != 2 || got[0]["default"] != true || got[1]["reasoning"] != true {
+		t.Fatalf("%v", got)
+	}
+}

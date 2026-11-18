@@ -37,16 +37,27 @@
   import type { LanguageModelUsage } from "$lib/components/ai-elements/context/context-context.svelte";
 
   const emptyStateSuggestions = [
-    { title: "Ask a question", text: "What can you help me with?" },
-    { title: "Get started", text: "How does this work?" },
-    {
-      title: "Test UI elements",
-      text: "Run a full UI elements integration test with code block, artifact, confirmation, plan, and queue in one response.",
-    },
+    "What can you help me with?",
+    "How does this work?",
+    "What's new in Svelte this month? Cite sources.",
+    "Draw a minimalist logo of a paper plane",
+    "Run a full UI elements integration test with code block, artifact, confirmation, plan, and queue in one response.",
   ];
   import ChatInput from "./ChatInput.svelte";
   import type { PromptInputMessage } from "$lib/components/ai-elements/prompt-input";
-  import { streamChat, type StreamPart } from "$lib/chat/api";
+  import {
+    streamChat,
+    getModels,
+    restoreConversation,
+    type ModelInfo,
+    type StreamPart,
+  } from "$lib/chat/api";
+  import { Suggestions, Suggestion } from "$lib/components/ai-elements/suggestion/index.js";
+  import {
+    Checkpoint,
+    CheckpointIcon,
+    CheckpointTrigger,
+  } from "$lib/components/ai-elements/checkpoint/index.js";
 
   /**
    * ChatWidget — Reusable AI chat interface for SaaS embedding.
@@ -239,11 +250,44 @@
 
   const useRealApi = $derived(!!apiBaseUrl && apiBaseUrl.startsWith("http"));
 
+  let models = $state<ModelInfo[]>([]);
+  let model = $state("");
+  let webSearch = $state(false);
+  let imageGen = $state(false);
+
+  $effect(() => {
+    if (!useRealApi) return;
+    getModels({ apiBaseUrl, authToken: authToken || undefined })
+      .then((list) => {
+        models = list;
+        model = list.find((m) => m.default)?.id ?? list[0]?.id ?? "";
+      })
+      .catch(() => (models = [])); // selector stays hidden; backend default model is used
+  });
+
+  async function handleRestore(msg: ChatMessage) {
+    if (status !== "idle" || !msg.backendId || !currentBackendConversationId) return;
+    try {
+      await restoreConversation(
+        { apiBaseUrl, authToken: authToken || undefined, tenantId: tenantId || undefined },
+        currentBackendConversationId,
+        msg.backendId,
+      );
+    } catch (err) {
+      console.error(err);
+      return;
+    }
+    updateActiveConversation((conv) => {
+      const idx = conv.messages.findIndex((m) => m.id === msg.id);
+      return idx < 0 ? conv : { ...conv, messages: conv.messages.slice(0, idx + 1) };
+    });
+  }
+
   const lastAssistantMsg = $derived(
     [...activeMessages].reverse().find((m) => m.role === "assistant"),
   );
   const isStreamingEmpty = $derived(
-    status === "streaming" && !!lastAssistantMsg && !lastAssistantMsg.content && !(lastAssistantMsg.parts?.length),
+    status === "streaming" && !!lastAssistantMsg && !lastAssistantMsg.content && !lastAssistantMsg.reasoning && !(lastAssistantMsg.parts?.length),
   );
   const showLoader = $derived(status === "submitted" || isStreamingEmpty);
   const messagesToShow = $derived(
@@ -530,9 +574,10 @@
   async function processMessage(text: string, queueItemId?: string) {
     if (status !== "idle" && !queueItemId) return;
 
+    const userId = crypto.randomUUID();
     updateActiveConversation((conv) => ({
       ...conv,
-      messages: [...conv.messages, { id: crypto.randomUUID(), role: "user" as const, content: text }],
+      messages: [...conv.messages, { id: userId, role: "user" as const, content: text }],
     }));
     input = "";
     status = "submitted";
@@ -572,12 +617,25 @@
           {
             input: text.trim(),
             conversation_id: backendConversationId || undefined,
+            model: model || undefined,
+            tools: [
+              ...(webSearch ? (["web_search"] as const) : []),
+              ...(imageGen ? (["image_generation"] as const) : []),
+            ],
           },
           {
             onDelta(delta) {
               updateMessageById(assistantId, (msg) => ({
                 ...msg,
                 content: msg.content + delta,
+                reasoningStreaming: false,
+              }));
+            },
+            onReasoningDelta(delta) {
+              updateMessageById(assistantId, (msg) => ({
+                ...msg,
+                reasoning: (msg.reasoning ?? "") + delta,
+                reasoningStreaming: true,
               }));
             },
             onPart(part: StreamPart) {
@@ -606,10 +664,16 @@
               totalInputTokens += inputTok;
               totalOutputTokens += outputTok;
             },
-            onCompleted(convId) {
+            onCompleted(info) {
               updateActiveConversation((conv) => ({
                 ...conv,
-                backendConversationId: convId,
+                backendConversationId: info.conversation_id,
+              }));
+              updateMessageById(userId, (msg) => ({ ...msg, backendId: info.user_message_id }));
+              updateMessageById(assistantId, (msg) => ({
+                ...msg,
+                backendId: info.message_id,
+                reasoningStreaming: false,
               }));
               promoteAssistantMessageToStructuredPart(assistantId, text.trim());
               finishProcessing();
@@ -668,7 +732,7 @@
           <SidebarTrigger />
           <div class="text-sm font-semibold flex-1">{title}</div>
           {#if usedTokens > 0}
-            <Context {usedTokens} {maxTokens} usage={tokenUsage} modelId="gpt-4o">
+            <Context {usedTokens} {maxTokens} usage={tokenUsage} modelId={model || "gpt-4o"}>
               <ContextTrigger />
               <ContextContent>
                 <ContextContentHeader />
@@ -698,23 +762,33 @@
                 <p class="text-sm text-muted-foreground max-w-sm mb-8">
                   Send a message below to get started.
                 </p>
-                <div
-                  class="grid grid-cols-1 sm:grid-cols-2 gap-2 w-full max-w-md"
-                >
-                  {#each emptyStateSuggestions as suggestion}
-                    <button
-                      onclick={() => onSubmit({ text: suggestion.text } as any)}
-                      class="text-left p-3 rounded-lg text-xs border border-border bg-card hover:border-primary/50 hover:bg-secondary transition-colors"
-                    >
-                      {suggestion.title}
-                    </button>
-                  {/each}
+                <div class="w-full max-w-2xl">
+                  <Suggestions scrollbarXClasses="hidden">
+                    {#each emptyStateSuggestions as suggestion (suggestion)}
+                      <Suggestion
+                        {suggestion}
+                        onclick={(text: string) => onSubmit({ text } as PromptInputMessage)}
+                      />
+                    {/each}
+                  </Suggestions>
                 </div>
               </ConversationEmptyState>
             {/if}
 
-            {#each messagesToShow as msg (msg.id)}
+            {#each messagesToShow as msg, i (msg.id)}
               <ChatMessageItem {msg} {shikiTheme} onUpdatePart={handleUpdatePart} onRetry={handleRetry} />
+              {#if msg.role === "assistant" && msg.backendId && i < messagesToShow.length - 1}
+                <Checkpoint>
+                  <CheckpointIcon />
+                  <CheckpointTrigger
+                    onclick={() => handleRestore(msg)}
+                    tooltip="Restores the chat to this point"
+                    disabled={status !== "idle"}
+                  >
+                    Restore checkpoint
+                  </CheckpointTrigger>
+                </Checkpoint>
+              {/if}
             {/each}
 
             {#if showLoader}
@@ -801,7 +875,16 @@
         {/if}
 
         <!-- Input -->
-        <ChatInput bind:input {status} {placeholder} {onSubmit} />
+        <ChatInput
+          bind:input
+          bind:model
+          bind:webSearch
+          bind:imageGen
+          {status}
+          {placeholder}
+          {onSubmit}
+          {models}
+        />
       </div>
     </Sidebar.Inset>
   </Sidebar.Provider>

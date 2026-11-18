@@ -1,10 +1,9 @@
 <script lang="ts">
 	import { cn } from "$lib/utils";
-	import type { UIMessage } from "ai";
 	import type { HTMLAttributes } from "svelte/elements";
 
 	type MessageProps = HTMLAttributes<HTMLDivElement> & {
-		from: UIMessage["role"];
+		from: "user" | "assistant" | "system";
 	};
 
 	let { class: className = "", from, children, ...restProps }: MessageProps = $props();

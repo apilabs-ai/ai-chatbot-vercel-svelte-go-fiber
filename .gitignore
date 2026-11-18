@@ -33,8 +33,6 @@ vendor/
 *.out
 go.work
 
-go.sum
-
 ### Aws ###
 # AWS credentials and configuration files
 

@@ -52,6 +52,18 @@
         InlineCitationSource,
         InlineCitationQuote,
     } from "$lib/components/ai-elements/inline-citation";
+    import { Reasoning, ReasoningTrigger, ReasoningContent } from "$lib/components/ai-elements/reasoning/index.js";
+    import { Sources, SourcesTrigger, SourcesContent, Source } from "$lib/components/ai-elements/sources/index.js";
+    import { Image } from "$lib/components/ai-elements/image/index.js";
+    import {
+        OpenIn,
+        OpenInTrigger,
+        OpenInContent,
+        OpenInChatGPT,
+        OpenInClaude,
+        OpenInT3,
+        OpenInScira,
+    } from "$lib/components/ai-elements/open-in-chat/index.js";
     import { 
         Code2, 
         CircleAlert, 
@@ -92,6 +104,12 @@
         {#if msg.role === "user"}
             {msg.content}
         {:else}
+            {#if msg.reasoning}
+                <Reasoning class="mb-3 w-full" isStreaming={msg.reasoningStreaming}>
+                    <ReasoningTrigger />
+                    <ReasoningContent content={msg.reasoning} />
+                </Reasoning>
+            {/if}
             {#if msg.content}
                 <div class="mb-3">
                     <Response content={msg.content} theme={shikiTheme} />
@@ -323,6 +341,26 @@
                             {/if}
                         </Queue>
                     </div>
+                {:else if part.type === "sources" && part.meta?.sources?.length}
+                    <div class="my-3">
+                        <Sources>
+                            <SourcesTrigger count={part.meta.sources.length} />
+                            <SourcesContent>
+                                {#each part.meta.sources as source (source.url)}
+                                    <Source href={source.url} title={source.title} />
+                                {/each}
+                            </SourcesContent>
+                        </Sources>
+                    </div>
+                {:else if part.type === "image" && part.content}
+                    <div class="my-3">
+                        <Image
+                            base64={part.content}
+                            mediaType={part.meta?.media_type ?? "image/png"}
+                            alt="Generated image"
+                            class="max-h-96 border"
+                        />
+                    </div>
                 {:else if part.type === "citation" && part.meta?.sources}
                     <div class="my-3">
                         <InlineCitation>
@@ -388,4 +426,17 @@
             {/if}
         {/if}
     </MessageContent>
+    {#if msg.role === "user"}
+        <div class="order-first self-center opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+            <OpenIn query={msg.content}>
+                <OpenInTrigger />
+                <OpenInContent>
+                    <OpenInChatGPT />
+                    <OpenInClaude />
+                    <OpenInT3 />
+                    <OpenInScira />
+                </OpenInContent>
+            </OpenIn>
+        </div>
+    {/if}
 </Message>
