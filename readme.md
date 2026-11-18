@@ -22,7 +22,7 @@ See the detailed READMEs:
 
 ## Requirements
 
-- Go 1.21+
+- Go 1.26+
 - Node.js 18+
 - pnpm 9+
 
